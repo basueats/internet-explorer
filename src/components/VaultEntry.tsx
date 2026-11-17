@@ -22,10 +22,9 @@ import {
   normalizeSpaceName,
 } from '../lib/crypto';
 import {
+  connectAndJoinSpace,
   extractErrorMessage,
-  joinRoomViaWebSocket,
   ProxyAuthError,
-  safeFetchJson,
 } from '../lib/api';
 import {
   buildMeetingInviteUrl,
@@ -91,50 +90,21 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
     setIsSubmitting(true);
     try {
       const creds = await deriveSpaceCredentials(normalized, rawPassphrase);
-      type JoinResponse = {
-        ok?: boolean;
-        isNew?: boolean;
-        code?: string;
-        messages?: EncryptedMessageEnvelope[];
-        error?: string;
-      };
-
-      let result: { status: number; ok: boolean; data: JoinResponse };
+      let result: Awaited<ReturnType<typeof connectAndJoinSpace>>;
       try {
-        result = await safeFetchJson<JoinResponse>('/api/rooms/join', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomId: creds.roomId,
-            gateHash: creds.gateHash,
-            mode: entryMode,
-          }),
+        result = await connectAndJoinSpace({
+          roomId: creds.roomId,
+          gateHash: creds.gateHash,
+          mode: entryMode,
         });
       } catch (err) {
-        const shouldFallbackToWs =
-          err instanceof ProxyAuthError ||
-          err instanceof TypeError ||
-          (err instanceof Error && /HTML page|Network request failed|Failed to fetch/i.test(err.message));
-
-        if (shouldFallbackToWs) {
-          try {
-            result = await joinRoomViaWebSocket<JoinResponse>({
-              roomId: creds.roomId,
-              gateHash: creds.gateHash,
-              mode: entryMode,
-            });
-          } catch {
-            if (err instanceof ProxyAuthError) {
-              setNeedsSessionReload(true);
-              throw new Error(
-                'Your browser blocked or expired the preview session cookie (HTTP 403). Click "Refresh Session" or open the app in a new tab.'
-              );
-            }
-            throw err;
-          }
-        } else {
-          throw err;
+        if (err instanceof ProxyAuthError) {
+          setNeedsSessionReload(true);
+          throw new Error(
+            'Your browser blocked or expired the preview session cookie (HTTP 403). Click "Refresh Session" or open the app in a new tab.'
+          );
         }
+        throw err;
       }
 
       if (!result.ok || !result.data.ok) {
@@ -162,6 +132,7 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
         aesKey: creds.aesKey,
         safetyNumber: creds.safetyNumber,
         keyFingerprint: creds.keyFingerprint,
+        transport: result.transport,
       };
 
       onEnterSpace(session, result.data.messages || [], Boolean(result.data.isNew));

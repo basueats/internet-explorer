@@ -107,6 +107,7 @@ export interface SpaceSession {
   aesKey: CryptoKey;
   safetyNumber: string;
   keyFingerprint: string;
+  transport?: 'server' | 'relay';
 }
 
 export interface DeviceNetworkInfo {

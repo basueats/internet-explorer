@@ -36,6 +36,7 @@ import {
   urlBase64ToUint8Array,
 } from '../lib/device';
 import { formatBytes, formatDuration, scrubAndCompressImage } from '../lib/media';
+import { RelayRoomConnection } from '../lib/relay';
 import { buildMeetingInviteUrl } from '../lib/session';
 import type {
   ChatMessage,
@@ -171,6 +172,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const wsRef = useRef<WebSocket | null>(null);
+  const relayRef = useRef<RelayRoomConnection | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -391,17 +393,21 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   // Automatically send read receipts for partner messages when unlocked & visible
   const markPartnerMessagesAsRead = useCallback(() => {
     if (isLockedRef.current || document.visibilityState !== 'visible') return;
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
     const unreadIds = messages
       .filter((m) => !m.isMine && !m.deletedScope && m.receiptStatus !== 'read')
       .map((m) => m.id);
 
-    if (unreadIds.length > 0) {
-      ws.send(JSON.stringify({ type: 'receipt:read', messageIds: unreadIds }));
+    if (unreadIds.length === 0) return;
+
+    if (session.transport === 'relay') {
+      void relayRef.current?.sendReceipt(unreadIds, 'read');
+      return;
     }
-  }, [messages]);
+
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'receipt:read', messageIds: unreadIds }));
+  }, [messages, session.transport]);
 
   useEffect(() => {
     markPartnerMessagesAsRead();
@@ -417,9 +423,158 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     };
   }, [markPartnerMessagesAsRead]);
 
-  // Real WebSocket connection + auto-reconnect
+  // Real-time connection (Express WebSocket or Serverless Relay fallback)
   useEffect(() => {
     let unmounted = false;
+
+    const handleIncomingMessageCreated = async (
+      incomingEnv: EncryptedMessageEnvelope,
+      ackReceipt: (status: 'delivered' | 'read') => void
+    ) => {
+      let isFromMe = incomingEnv.senderClientId === session.clientId;
+      let senderAlias: string | undefined;
+      try {
+        const p = await decryptPayload(
+          session.aesKey,
+          incomingEnv.iv,
+          incomingEnv.ciphertext
+        );
+        isFromMe = p.senderClientId === session.clientId;
+        senderAlias = p.senderAlias;
+      } catch {
+        // Ignore
+      }
+
+      if (unmounted) return;
+
+      setRawEnvelopes((prev) => {
+        if (prev.some((m) => m.id === incomingEnv.id)) {
+          return prev.map((m) =>
+            m.id === incomingEnv.id
+              ? { ...m, receiptStatus: incomingEnv.receiptStatus || m.receiptStatus }
+              : m
+          );
+        }
+        return [...prev, incomingEnv];
+      });
+
+      if (!isFromMe) {
+        const status =
+          isLockedRef.current || document.visibilityState !== 'visible'
+            ? 'delivered'
+            : 'read';
+        ackReceipt(status);
+        triggerUnlockedAlert(incomingEnv.senderClientId, senderAlias);
+      }
+    };
+
+    const handleReceiptUpdated = (
+      messageIds: string[],
+      nextStatus: 'delivered' | 'read'
+    ) => {
+      const idSet = new Set(messageIds);
+      let newlyBlueTicked = false;
+
+      setRawEnvelopes((prev) =>
+        prev.map((m) => {
+          if (!idSet.has(m.id)) return m;
+          const isMine = m.senderClientId === session.clientId;
+          if (isMine && nextStatus === 'read' && m.receiptStatus !== 'read') {
+            newlyBlueTicked = true;
+          }
+          return { ...m, receiptStatus: nextStatus };
+        })
+      );
+
+      if (newlyBlueTicked && alertsEnabledRef.current && !isLockedRef.current) {
+        playBlueTickFeedback();
+        showScreenAlert(
+          'Blue Tick · Read by Partner',
+          'Your partner opened and read your encrypted message'
+        );
+        void showBrowserNotificationBar(
+          'Internet Edge · Blue Tick',
+          'Your partner read your encrypted message',
+          'veil-blue-tick'
+        );
+      }
+    };
+
+    if (session.transport === 'relay') {
+      const relay = new RelayRoomConnection(
+        session.roomId,
+        session.gateHash,
+        session.clientId,
+        {
+          onConnectionChange: (state) => {
+            if (!unmounted) setConnectionState(state);
+          },
+          onRoomSynced: (msgs) => {
+            if (!unmounted) setRawEnvelopes(msgs);
+          },
+          onMessageCreated: (msg) => {
+            void handleIncomingMessageCreated(msg, (status) => {
+              void relay.sendReceipt([msg.id], status);
+            });
+          },
+          onReceiptUpdated: (ids, status) => {
+            if (!unmounted) handleReceiptUpdated(ids, status);
+          },
+          onMessageSoftDeleted: (messageId, deletedByClientId) => {
+            if (unmounted) return;
+            setRawEnvelopes((prev) =>
+              prev.map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      deletedForEveryone: true,
+                      deletedByClientId,
+                      iv: '',
+                      ciphertext: '',
+                    }
+                  : m
+              )
+            );
+          },
+          onMessageDeleted: (messageId) => {
+            if (!unmounted) {
+              setRawEnvelopes((prev) => prev.filter((m) => m.id !== messageId));
+            }
+          },
+          onMessagesExpired: (expiredIds) => {
+            if (unmounted) return;
+            const expiredSet = new Set(expiredIds);
+            setRawEnvelopes((prev) => prev.filter((m) => !expiredSet.has(m.id)));
+          },
+          onRoomCleared: () => {
+            if (!unmounted) setRawEnvelopes([]);
+          },
+          onPresenceUpdate: (activeCount, online) => {
+            if (unmounted) return;
+            setActiveDevices(activeCount);
+            setPartnerOnline(online);
+          },
+          onPartnerTyping: (isTyping) => {
+            if (unmounted) return;
+            setPartnerTyping(isTyping);
+            if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+            if (isTyping) {
+              typingTimeoutRef.current = setTimeout(() => {
+                setPartnerTyping(false);
+              }, 3500);
+            }
+          },
+        }
+      );
+      relayRef.current = relay;
+
+      return () => {
+        unmounted = true;
+        if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+        relay.close();
+        relayRef.current = null;
+      };
+    }
 
     const connect = () => {
       if (unmounted) return;
@@ -465,77 +620,21 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
           if (data.type === 'message:created' && data.message) {
             const incomingEnv = data.message;
-            let isFromMe = false;
-            let senderAlias: string | undefined;
-            try {
-              const p = await decryptPayload(
-                session.aesKey,
-                incomingEnv.iv,
-                incomingEnv.ciphertext
-              );
-              isFromMe = p.senderClientId === session.clientId;
-              senderAlias = p.senderAlias;
-            } catch {
-              // Ignore
-            }
-
-            setRawEnvelopes((prev) => {
-              if (prev.some((m) => m.id === incomingEnv.id)) {
-                // Update server receiptStatus on already-optimistic outgoing message
-                return prev.map((m) =>
-                  m.id === incomingEnv.id
-                    ? { ...m, receiptStatus: incomingEnv.receiptStatus || m.receiptStatus }
-                    : m
-                );
-              }
-              return [...prev, incomingEnv];
-            });
-
-            if (!isFromMe) {
-              // Confirm delivery immediately; read receipt follows automatically if unlocked & visible
+            await handleIncomingMessageCreated(incomingEnv, (status) => {
               if (ws.readyState === WebSocket.OPEN) {
                 ws.send(
                   JSON.stringify({
-                    type: isLockedRef.current || document.visibilityState !== 'visible'
-                      ? 'receipt:delivered'
-                      : 'receipt:read',
+                    type: status === 'delivered' ? 'receipt:delivered' : 'receipt:read',
                     messageIds: [incomingEnv.id],
                   })
                 );
               }
-              triggerUnlockedAlert(incomingEnv.senderClientId, senderAlias);
-            }
+            });
             return;
           }
 
           if (data.type === 'receipt:updated' && Array.isArray(data.messageIds) && data.status) {
-            const idSet = new Set(data.messageIds);
-            const nextStatus = data.status;
-            let newlyBlueTicked = false;
-
-            setRawEnvelopes((prev) =>
-              prev.map((m) => {
-                if (!idSet.has(m.id)) return m;
-                const isMine = m.senderClientId === session.clientId;
-                if (isMine && nextStatus === 'read' && m.receiptStatus !== 'read') {
-                  newlyBlueTicked = true;
-                }
-                return { ...m, receiptStatus: nextStatus };
-              })
-            );
-
-            if (newlyBlueTicked && alertsEnabledRef.current && !isLockedRef.current) {
-              playBlueTickFeedback();
-              showScreenAlert(
-                'Blue Tick · Read by Partner',
-                'Your partner opened and read your encrypted message'
-              );
-              void showBrowserNotificationBar(
-                'Internet Edge · Blue Tick',
-                'Your partner read your encrypted message',
-                'veil-blue-tick'
-              );
-            }
+            handleReceiptUpdated(data.messageIds, data.status);
             return;
           }
 
@@ -621,6 +720,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     session.gateHash,
     session.clientId,
     session.aesKey,
+    session.transport,
+    showScreenAlert,
     triggerUnlockedAlert,
   ]);
 
@@ -629,6 +730,9 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   }, [messages.length, partnerTyping]);
 
   const registerWebPushSubscription = useCallback(async (): Promise<boolean> => {
+    if (session.transport === 'relay') {
+      return false;
+    }
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
       return false;
     }
@@ -666,7 +770,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     } catch {
       return false;
     }
-  }, [session.roomId, session.gateHash, session.clientId]);
+  }, [session.roomId, session.gateHash, session.clientId, session.transport]);
 
   useEffect(() => {
     if (alertsEnabled && notificationPermission === 'granted') {
@@ -688,17 +792,19 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     if (alertsEnabled && (currentPerm === 'granted' || currentPerm === 'unsupported')) {
       setAlertsEnabled(false);
       localStorage.setItem('veil_alerts_enabled', 'false');
-      try {
-        await fetch(`/api/rooms/${session.roomId}/push-subscribe`, {
-          method: 'DELETE',
-          credentials: 'same-origin',
-          headers: {
-            'x-gate-hash': session.gateHash,
-            'x-client-id': session.clientId,
-          },
-        });
-      } catch {
-        // Ignore
+      if (session.transport !== 'relay') {
+        try {
+          await fetch(`/api/rooms/${session.roomId}/push-subscribe`, {
+            method: 'DELETE',
+            credentials: 'same-origin',
+            headers: {
+              'x-gate-hash': session.gateHash,
+              'x-client-id': session.clientId,
+            },
+          });
+        } catch {
+          // Ignore
+        }
       }
       return;
     }
@@ -745,11 +851,15 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   };
 
   const emitTyping = (isTyping: boolean) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const now = Date.now();
     if (isTyping && now - lastTypingEmitRef.current < 1500) return;
     lastTypingEmitRef.current = now;
+    if (session.transport === 'relay') {
+      void relayRef.current?.sendTyping(isTyping);
+      return;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ type: 'typing', isTyping }));
   };
 
@@ -823,6 +933,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         'Internet Edge',
         'Encrypted message sent'
       );
+    }
+
+    if (session.transport === 'relay') {
+      await relayRef.current?.sendMessage(envelope);
+      return;
     }
 
     try {
@@ -950,6 +1065,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
       )
     );
 
+    if (session.transport === 'relay') {
+      await relayRef.current?.softDeleteMessage(target.id);
+      return;
+    }
+
     try {
       await fetch(`/api/rooms/${session.roomId}/messages/${target.id}/soft-delete`, {
         method: 'POST',
@@ -968,6 +1088,10 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     delete next[messageId];
     persistArchive(next);
     setRawEnvelopes((prev) => prev.filter((m) => m.id !== messageId));
+    if (session.transport === 'relay') {
+      await relayRef.current?.deleteMessage(messageId);
+      return;
+    }
     try {
       await fetch(`/api/rooms/${session.roomId}/messages/${messageId}`, {
         method: 'DELETE',
@@ -982,6 +1106,10 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     setRawEnvelopes([]);
     persistArchive({});
     setConfirmClearAll(false);
+    if (session.transport === 'relay') {
+      await relayRef.current?.clearRoom();
+      return;
+    }
     await fetch(`/api/rooms/${session.roomId}/messages`, {
       method: 'DELETE',
       headers: { 'x-gate-hash': session.gateHash },

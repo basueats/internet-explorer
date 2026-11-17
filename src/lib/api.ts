@@ -1,3 +1,6 @@
+import type { EncryptedMessageEnvelope } from '../types';
+import { joinSpaceViaRelay } from './relay';
+
 export function extractErrorMessage(input: unknown, fallback: string): string {
   if (!input) return fallback;
   if (typeof input === 'string') {
@@ -40,10 +43,19 @@ export class ProxyAuthError extends Error {
   }
 }
 
+export class BackendUnavailableError extends Error {
+  status: number;
+  constructor(status: number, message?: string) {
+    super(message || `Backend API unavailable (HTTP ${status}).`);
+    this.name = 'BackendUnavailableError';
+    this.status = status;
+  }
+}
+
 export async function safeFetchJson<T>(
   input: RequestInfo | URL,
   init: RequestInit = {},
-  retries = 2
+  retries = 1
 ): Promise<{ status: number; ok: boolean; data: T }> {
   let lastError: Error | null = null;
 
@@ -60,6 +72,7 @@ export async function safeFetchJson<T>(
       });
 
       const contentType = response.headers.get('content-type') || '';
+      const isExpressBackend = response.headers.get('x-ie-backend') === 'express';
       const rawText = await response.text();
 
       const looksLikeHtml =
@@ -70,12 +83,19 @@ export async function safeFetchJson<T>(
         if (response.status === 401 || response.status === 403) {
           throw new ProxyAuthError(response.status);
         }
+        if (response.status === 404 || response.status >= 500) {
+          throw new BackendUnavailableError(
+            response.status,
+            `Backend endpoint unavailable (HTTP ${response.status}).`
+          );
+        }
         if (attempt < retries) {
-          await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+          await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
           continue;
         }
-        throw new Error(
-          `Server returned an HTML page (HTTP ${response.status}) instead of API JSON. Please refresh the page and try again.`
+        throw new BackendUnavailableError(
+          response.status,
+          `Server returned an HTML page (HTTP ${response.status}) instead of API JSON.`
         );
       }
 
@@ -87,6 +107,9 @@ export async function safeFetchJson<T>(
           if (response.status === 401 || response.status === 403) {
             throw new ProxyAuthError(response.status);
           }
+          if (response.status === 404 || response.status >= 500) {
+            throw new BackendUnavailableError(response.status);
+          }
           throw new Error(
             `Unexpected server response (HTTP ${response.status}). Please refresh and try again.`
           );
@@ -96,6 +119,7 @@ export async function safeFetchJson<T>(
       const parsedRecord =
         parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
       const isAppAuthRejection =
+        isExpressBackend ||
         parsedRecord?.code === 'INVALID_PASSPHRASE' ||
         parsedRecord?.error === 'Incorrect secret passphrase for this unique space name.' ||
         parsedRecord?.error === 'Unauthorized space access.';
@@ -110,18 +134,35 @@ export async function safeFetchJson<T>(
         );
       }
 
+      const isAppNotFound =
+        isExpressBackend ||
+        parsedRecord?.code === 'ROOM_NOT_FOUND' ||
+        parsedRecord?.error ===
+          'No private space found with that unique name. Switch to Create Space to start it.' ||
+        parsedRecord?.error === 'Private space not found.';
+
+      if (response.status === 404 && !isAppNotFound) {
+        throw new BackendUnavailableError(
+          404,
+          extractErrorMessage(parsed, 'Backend API not found on this host.')
+        );
+      }
+
       return {
         status: response.status,
         ok: response.ok,
         data: parsed as T,
       };
     } catch (err) {
-      lastError = err instanceof Error ? err : new Error(extractErrorMessage(err, 'Network request failed.'));
-      if (err instanceof ProxyAuthError) {
+      lastError =
+        err instanceof Error
+          ? err
+          : new Error(extractErrorMessage(err, 'Network request failed.'));
+      if (err instanceof ProxyAuthError || err instanceof BackendUnavailableError) {
         throw err;
       }
       if (attempt < retries) {
-        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
         continue;
       }
     }
@@ -199,3 +240,56 @@ export function joinRoomViaWebSocket<T>(payload: {
     };
   });
 }
+
+export interface JoinSpaceResponse {
+  ok?: boolean;
+  isNew?: boolean;
+  code?: string;
+  messages?: EncryptedMessageEnvelope[];
+  error?: string;
+}
+
+export async function connectAndJoinSpace(payload: {
+  roomId: string;
+  gateHash: string;
+  mode: 'create' | 'join' | 'auto';
+}): Promise<{
+  status: number;
+  ok: boolean;
+  data: JoinSpaceResponse;
+  transport: 'server' | 'relay';
+}> {
+  try {
+    const res = await safeFetchJson<JoinSpaceResponse>('/api/rooms/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return { ...res, transport: 'server' };
+  } catch (err) {
+    if (err instanceof BackendUnavailableError) {
+      const relayRes = await joinSpaceViaRelay(payload);
+      return { ...relayRes, transport: 'relay' };
+    }
+
+    if (
+      err instanceof ProxyAuthError ||
+      err instanceof TypeError ||
+      (err instanceof Error && /Network request failed|Failed to fetch/i.test(err.message))
+    ) {
+      try {
+        const wsRes = await joinRoomViaWebSocket<JoinSpaceResponse>(payload);
+        return { ...wsRes, transport: 'server' };
+      } catch {
+        if (err instanceof ProxyAuthError) {
+          throw err;
+        }
+        const relayRes = await joinSpaceViaRelay(payload);
+        return { ...relayRes, transport: 'relay' };
+      }
+    }
+
+    throw err;
+  }
+}
+

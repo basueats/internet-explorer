@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { VaultEntry } from './components/VaultEntry';
-import { joinRoomViaWebSocket, ProxyAuthError, safeFetchJson } from './lib/api';
+import { connectAndJoinSpace } from './lib/api';
 import { deriveSpaceCredentials, getOrCreateClientId } from './lib/crypto';
 import {
   getSavedLastSession,
@@ -70,34 +70,11 @@ export default function App() {
       try {
         const { bookmark } = saved;
         const creds = await deriveSpaceCredentials(bookmark.spaceName, bookmark.passphrase);
-        type JoinResponse = {
-          ok?: boolean;
-          isNew?: boolean;
-          messages?: EncryptedMessageEnvelope[];
-        };
-
-        let result: { ok: boolean; data: JoinResponse };
-        try {
-          result = await safeFetchJson<JoinResponse>('/api/rooms/join', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              roomId: creds.roomId,
-              gateHash: creds.gateHash,
-              mode: 'auto',
-            }),
-          });
-        } catch (err) {
-          if (err instanceof ProxyAuthError) {
-            result = await joinRoomViaWebSocket<JoinResponse>({
-              roomId: creds.roomId,
-              gateHash: creds.gateHash,
-              mode: 'auto',
-            });
-          } else {
-            throw err;
-          }
-        }
+        const result = await connectAndJoinSpace({
+          roomId: creds.roomId,
+          gateHash: creds.gateHash,
+          mode: 'auto',
+        });
 
         if (!cancelled && result.ok && result.data.ok) {
           setActiveSpace({
@@ -112,6 +89,7 @@ export default function App() {
               aesKey: creds.aesKey,
               safetyNumber: creds.safetyNumber,
               keyFingerprint: creds.keyFingerprint,
+              transport: result.transport,
             },
             initialMessages: result.data.messages || [],
             isNewSpace: Boolean(result.data.isNew),

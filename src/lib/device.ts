@@ -2,9 +2,41 @@ import type { DeviceNetworkInfo } from '../types';
 import { safeFetchJson } from './api';
 
 export async function fetchDeviceNetworkInfo(): Promise<DeviceNetworkInfo> {
-  const { ok, data } = await safeFetchJson<DeviceNetworkInfo>('/api/device-info');
-  if (!ok) {
-    throw new Error('Could not retrieve network details.');
+  let data: DeviceNetworkInfo | null = null;
+  try {
+    const res = await safeFetchJson<DeviceNetworkInfo>('/api/device-info', {}, 0);
+    if (res.ok && res.data?.ip) {
+      data = res.data;
+    }
+  } catch {
+    // Backend /api/device-info unavailable (e.g. static/Vercel deploy) — fall back to public IP lookup
+  }
+
+  if (!data) {
+    let publicIp = 'Unavailable';
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      const pubRes = await fetch('https://api.ipify.org?format=json', {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (pubRes.ok) {
+        const pubJson = (await pubRes.json()) as { ip?: string };
+        if (pubJson.ip) publicIp = pubJson.ip;
+      }
+    } catch {
+      // Ignore external IP lookup timeout
+    }
+    return {
+      ip: publicIp,
+      publicIp: publicIp !== 'Unavailable' ? publicIp : null,
+      city: null,
+      region: null,
+      country: null,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'Unknown',
+      serverTime: Date.now(),
+    };
   }
 
   // If behind local loopback or private proxy, also try resolving public WAN IP

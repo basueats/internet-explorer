@@ -230,9 +230,15 @@ setInterval(() => {
   }
 }, 5000);
 
+// Mark all Express backend API responses
+app.use('/api', (_req, res, next) => {
+  res.setHeader('x-ie-backend', 'express');
+  next();
+});
+
 // Health check
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, backend: 'express' });
 });
 
 // Exact Device IP & Server-Observed Network Location Headers
@@ -355,6 +361,7 @@ app.post('/api/rooms/join', (req, res) => {
   if (!existing) {
     if (mode === 'join') {
       res.status(404).json({
+        code: 'ROOM_NOT_FOUND',
         error: 'No private space found with that unique name. Switch to Create Space to start it.',
       });
       return;
@@ -602,6 +609,7 @@ async function startServer(): Promise<void> {
                   requestId,
                   ok: false,
                   status: 404,
+                  code: 'ROOM_NOT_FOUND',
                   error:
                     'No private space found with that unique name. Switch to Create Space to start it.',
                 })
