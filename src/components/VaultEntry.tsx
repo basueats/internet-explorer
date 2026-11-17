@@ -21,7 +21,12 @@ import {
   getOrCreateClientId,
   normalizeSpaceName,
 } from '../lib/crypto';
-import { joinRoomViaWebSocket, ProxyAuthError, safeFetchJson } from '../lib/api';
+import {
+  extractErrorMessage,
+  joinRoomViaWebSocket,
+  ProxyAuthError,
+  safeFetchJson,
+} from '../lib/api';
 import {
   buildMeetingInviteUrl,
   clearSavedLastSession,
@@ -106,7 +111,12 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
           }),
         });
       } catch (err) {
-        if (err instanceof ProxyAuthError) {
+        const shouldFallbackToWs =
+          err instanceof ProxyAuthError ||
+          err instanceof TypeError ||
+          (err instanceof Error && /HTML page|Network request failed|Failed to fetch/i.test(err.message));
+
+        if (shouldFallbackToWs) {
           try {
             result = await joinRoomViaWebSocket<JoinResponse>({
               roomId: creds.roomId,
@@ -114,10 +124,13 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
               mode: entryMode,
             });
           } catch {
-            setNeedsSessionReload(true);
-            throw new Error(
-              'Your browser blocked or expired the preview session cookie (HTTP 403). Click "Refresh Session" or open the app in a new tab.'
-            );
+            if (err instanceof ProxyAuthError) {
+              setNeedsSessionReload(true);
+              throw new Error(
+                'Your browser blocked or expired the preview session cookie (HTTP 403). Click "Refresh Session" or open the app in a new tab.'
+              );
+            }
+            throw err;
           }
         } else {
           throw err;
@@ -129,7 +142,9 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
           const suffix = Math.floor(100 + Math.random() * 900);
           setSuggestedAvailableName(`${normalized}-${suffix}`);
         }
-        throw new Error(result.data.error || 'Could not open this private space.');
+        throw new Error(
+          extractErrorMessage(result.data, 'Could not open this private space.')
+        );
       }
 
       if (window.location.hash || window.location.search) {
@@ -151,7 +166,7 @@ export const VaultEntry: React.FC<VaultEntryProps> = ({
 
       onEnterSpace(session, result.data.messages || [], Boolean(result.data.isNew));
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Unable to unlock space.');
+      setErrorMsg(extractErrorMessage(err, 'Unable to unlock space.'));
     } finally {
       setIsSubmitting(false);
     }

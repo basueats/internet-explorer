@@ -1,3 +1,33 @@
+export function extractErrorMessage(input: unknown, fallback: string): string {
+  if (!input) return fallback;
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    return trimmed && trimmed !== '[object Object]' ? trimmed : fallback;
+  }
+  if (input instanceof Error) {
+    const msg = input.message?.trim();
+    if (msg && msg !== '[object Object]') return msg;
+    return fallback;
+  }
+  if (typeof input === 'object') {
+    const record = input as Record<string, unknown>;
+    if (record.error !== undefined) {
+      const nested = extractErrorMessage(record.error, '');
+      if (nested) return nested;
+    }
+    if (typeof record.message === 'string' && record.message.trim()) {
+      return record.message.trim();
+    }
+    if (typeof record.detail === 'string' && record.detail.trim()) {
+      return record.detail.trim();
+    }
+    if (typeof record.statusText === 'string' && record.statusText.trim()) {
+      return record.statusText.trim();
+    }
+  }
+  return fallback;
+}
+
 export class ProxyAuthError extends Error {
   status: number;
   constructor(status: number, message?: string) {
@@ -49,14 +79,44 @@ export async function safeFetchJson<T>(
         );
       }
 
-      const parsed = (rawText ? JSON.parse(rawText) : {}) as T;
+      let parsed: unknown = {};
+      if (rawText) {
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          if (response.status === 401 || response.status === 403) {
+            throw new ProxyAuthError(response.status);
+          }
+          throw new Error(
+            `Unexpected server response (HTTP ${response.status}). Please refresh and try again.`
+          );
+        }
+      }
+
+      const parsedRecord =
+        parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+      const isAppAuthRejection =
+        parsedRecord?.code === 'INVALID_PASSPHRASE' ||
+        parsedRecord?.error === 'Incorrect secret passphrase for this unique space name.' ||
+        parsedRecord?.error === 'Unauthorized space access.';
+
+      if ((response.status === 401 || response.status === 403) && !isAppAuthRejection) {
+        throw new ProxyAuthError(
+          response.status,
+          extractErrorMessage(
+            parsed,
+            `Preview session authorization expired or blocked (HTTP ${response.status}).`
+          )
+        );
+      }
+
       return {
         status: response.status,
         ok: response.ok,
-        data: parsed,
+        data: parsed as T,
       };
     } catch (err) {
-      lastError = err instanceof Error ? err : new Error('Network request failed.');
+      lastError = err instanceof Error ? err : new Error(extractErrorMessage(err, 'Network request failed.'));
       if (err instanceof ProxyAuthError) {
         throw err;
       }

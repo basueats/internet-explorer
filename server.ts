@@ -382,6 +382,7 @@ app.post('/api/rooms/join', (req, res) => {
       return;
     }
     res.status(403).json({
+      code: 'INVALID_PASSPHRASE',
       error: 'Incorrect secret passphrase for this unique space name.',
     });
     return;
@@ -649,6 +650,7 @@ async function startServer(): Promise<void> {
                 requestId,
                 ok: false,
                 status: 403,
+                code: 'INVALID_PASSPHRASE',
                 error: 'Incorrect secret passphrase for this unique space name.',
               })
             );
