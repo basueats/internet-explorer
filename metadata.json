@@ -1,0 +1,12 @@
+{
+  "name": "Internetexplorer",
+  "description": "An encrypted, private space for couples to share photos, voice notes, and texts without needing phone numbers or emails.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
